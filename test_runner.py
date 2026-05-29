@@ -52,8 +52,33 @@ RESUMABLE_SPECS = {
     "tests/sales-rep/store-breakdown-common.spec.ts",
 }
 
-BE_PORT = 4001
-FE_PORT = 3001
+def get_be_port() -> int:
+    env_file = BE_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("PORT"):
+                try:
+                    return int(line.split("=")[1].strip())
+                except ValueError:
+                    pass
+    return 4002
+
+def get_fe_port() -> int:
+    pkg_file = FE_DIR / "package.json"
+    if pkg_file.exists():
+        try:
+            data = json.loads(pkg_file.read_text(encoding="utf-8"))
+            dev_script = data.get("scripts", {}).get("dev", "")
+            m = re.search(r'-p\s+(\d+)', dev_script)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+    return 3002
+
+BE_PORT = get_be_port()
+FE_PORT = get_fe_port()
 
 # Suppress console flash for all subprocess calls (critical for pythonw / .pyw)
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -1471,6 +1496,16 @@ class TestRunnerApp(ctk.CTk):
         ctk.CTkButton(action_bar, text="▶▶  Run All Users", width=150,
                       fg_color="#2563eb", hover_color="#1d4ed8",
                       command=self._run_all_users).pack(side="left", padx=6, pady=6)
+        
+        self._run_last_failed_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(action_bar, text="Only Failed", variable=self._run_last_failed_var,
+                        font=("Segoe UI", 12), checkbox_width=18, checkbox_height=18
+                        ).pack(side="left", padx=(10, 6), pady=6)
+
+        ctk.CTkButton(action_bar, text="⏭  Skip Current", width=120,
+                      fg_color="#ea580c", hover_color="#c2410c", text_color="white",
+                      command=self._skip_current_test).pack(side="left", padx=6, pady=6)
+
         ctk.CTkButton(action_bar, text="⬛  Stop Tests", width=120,
                       fg_color=CLR_RED, hover_color="#c0392b",
                       command=self._stop_tests).pack(side="left", padx=6, pady=6)
@@ -1728,6 +1763,8 @@ class TestRunnerApp(ctk.CTk):
             # Build command
             files_str = " ".join(test_files)
             cmd = f'npx playwright test -g "{name}" {files_str}'
+            if getattr(self, "_run_last_failed_var", None) and self._run_last_failed_var.get():
+                cmd += " --last-failed"
             self._log(f"$ {cmd}", target="e2e")
 
             # Prepare results dir
@@ -1736,7 +1773,23 @@ class TestRunnerApp(ctk.CTk):
             run_dir = day_dir / f"{now.strftime('%H-%M-%S')}_{name.replace(' ', '_')}"
             run_dir.mkdir(parents=True, exist_ok=True)
 
+            # Clear old playwright-report and test-results to prevent stale artifacts
+            pw_report_dir = E2E_DIR / "playwright-report"
+            if pw_report_dir.exists():
+                try:
+                    shutil.rmtree(pw_report_dir)
+                except Exception as e:
+                    self._log(f"Warning: Could not clear {pw_report_dir}: {e}", "warn", "e2e")
+
+            pw_results_dir = E2E_DIR / "test-results"
+            if pw_results_dir.exists():
+                try:
+                    shutil.rmtree(pw_results_dir)
+                except Exception:
+                    pass
+
             log_lines = []
+            self._stop_signal_sent = False
             try:
                 self.test_process = subprocess.Popen(
                     cmd, cwd=str(E2E_DIR), shell=True,
@@ -1796,8 +1849,25 @@ class TestRunnerApp(ctk.CTk):
     def _stop_tests(self):
         self._stop_tests_flag = True
         if self.test_process and self.test_process.poll() is None:
+            if not getattr(self, "_stop_signal_sent", False):
+                self._log("⬛ Sending stop signal. Waiting for Playwright to compile report…", "warn", "e2e")
+                self._log("   (Click 'Stop Tests' again to force kill)", "warn", "e2e")
+                self._stop_signal_sent = True
+                try:
+                    os.kill(self.test_process.pid, signal.CTRL_BREAK_EVENT)
+                except Exception as e:
+                    self._log(f"Failed to send stop signal: {e}. Force killing…", "err", "e2e")
+                    kill_process_tree(self.test_process.pid)
+            else:
+                self._log("⬛ Force killing current test process…", "err", "e2e")
+                kill_process_tree(self.test_process.pid)
+
+    def _skip_current_test(self):
+        if self.test_process and self.test_process.poll() is None:
+            self._log("⏭ Skipping current test process…", "warn", "e2e")
             kill_process_tree(self.test_process.pid)
-            self._log("⬛ Killing current test process…", "warn", "e2e")
+        else:
+            self._log("No test process is currently running to skip.", "warn", "e2e")
 
     # ═══════════════════  RESULTS TAB  ═══════════════════
 
