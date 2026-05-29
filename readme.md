@@ -28,10 +28,24 @@ A powerful, high-performance GUI manager for local development and E2E testing o
 
 ## 📦 Installation & Setup
 
-1. **Clone the repository**:
+1. **Clone the repository (with submodules)**:
+   The `BE`, `FE`, and `E2E` folders are wired up as Git submodules, so the dependent repos are fetched automatically:
    ```powershell
-   git clone <your-repo-url>
+   # Fresh clone (gets the runner + BE/FE/E2E in one step)
+   git clone --recurse-submodules <your-repo-url>
    cd "Test runner"
+
+   # If you already cloned without --recurse-submodules:
+   git submodule update --init --recursive
+   ```
+   Submodule mapping:
+   - `BE/`  → `splink-rebate-api`
+   - `FE/`  → `splink-rebate-app`
+   - `E2E/` → `e2e_testing` (branch: `feature/test_runner-support`)
+
+   To later pull the latest commits for all submodules:
+   ```powershell
+   git submodule update --remote --merge
    ```
 
 2. **Set up a Virtual Environment**:

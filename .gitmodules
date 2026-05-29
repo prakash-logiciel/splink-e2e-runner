@@ -1,0 +1,10 @@
+[submodule "E2E"]
+	path = E2E
+	url = git@github.com:Splink-Technologies/e2e_testing.git
+	branch = feature/test_runner-support
+[submodule "BE"]
+	path = BE
+	url = git@github.com:Splink-Technologies/splink-rebate-api.git
+[submodule "FE"]
+	path = FE
+	url = git@github.com:Splink-Technologies/splink-rebate-app.git
