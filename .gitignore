@@ -1,1 +1,9 @@
 test_results_history/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local Claude Code session state
+.claude/
+CLAUDE.md

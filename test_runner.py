@@ -26,6 +26,7 @@ import tkinter as tk
 
 try:
     from plyer import notification as plyer_notification
+    _ = plyer_notification.notify  # force backend load (macOS needs pyobjus)
     HAS_NOTIFICATIONS = True
 except ImportError:
     HAS_NOTIFICATIONS = False
@@ -82,6 +83,38 @@ FE_PORT = get_fe_port()
 
 # Suppress console flash for all subprocess calls (critical for pythonw / .pyw)
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+_IS_WIN = sys.platform == "win32"
+
+
+def _proc_group_kwargs() -> dict:
+    """Popen kwargs that start a child in its own process group, so we can later
+    signal the whole tree (Ctrl-Break on Windows, SIGINT to the group on POSIX)."""
+    if _IS_WIN:
+        return {"creationflags": _NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _interrupt_process_group(proc):
+    """Send a graceful interrupt to a child started via _proc_group_kwargs()."""
+    if _IS_WIN:
+        os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+    else:
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+
+
+def _open_path(path):
+    """Open a file or folder with the OS default handler (cross-platform)."""
+    target = str(path)
+    try:
+        if _IS_WIN:
+            os.startfile(target)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", target])
+        else:
+            subprocess.run(["xdg-open", target])
+    except Exception:
+        webbrowser.open(target)
 
 ROLE_FOLDER_MAP = {
     "distributorMap": "distributor-admin",
@@ -244,6 +277,24 @@ def is_port_in_use(port: int) -> bool:
 
 
 def get_pid_on_port(port: int) -> Optional[int]:
+    # On macOS psutil.net_connections requires elevated privileges and returns
+    # nothing without sudo. Use lsof as the primary method on POSIX.
+    if not _IS_WIN:
+        try:
+            r = subprocess.run(
+                ["lsof", "-nP", "-iTCP:" + str(port), "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.splitlines()[1:]:  # skip header
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+    # Windows or lsof unavailable: fall back to psutil
     try:
         for conn in psutil.net_connections(kind="inet"):
             if conn.laddr.port == port and conn.status == "LISTEN":
@@ -254,21 +305,33 @@ def get_pid_on_port(port: int) -> Optional[int]:
 
 
 def kill_process_tree(pid: int):
-    try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            capture_output=True,
-            timeout=15,
-            creationflags=_NO_WINDOW,
-        )
-    except Exception:
+    if _IS_WIN:
         try:
-            p = psutil.Process(pid)
-            for ch in p.children(recursive=True):
-                ch.kill()
-            p.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=15,
+                creationflags=_NO_WINDOW,
+            )
+        except Exception:
             pass
+        return
+    # POSIX: kill the whole process group (works because we launched with
+    # start_new_session=True, which places the child in its own session/pgroup).
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGKILL)
+        return
+    except (ProcessLookupError, OSError):
+        pass
+    # Fallback: walk the psutil tree
+    try:
+        p = psutil.Process(pid)
+        for ch in p.children(recursive=True):
+            ch.kill()
+        p.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
 
 
 def get_git_info(repo_dir: Path) -> dict:
@@ -1204,7 +1267,7 @@ class TestRunnerApp(ctk.CTk):
                 proc = subprocess.Popen(
                     cmd, cwd=str(repo_dir), shell=True,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    **_proc_group_kwargs(),
                 )
                 if tgt == "be":
                     self.be_process = proc
@@ -1794,7 +1857,7 @@ class TestRunnerApp(ctk.CTk):
                 self.test_process = subprocess.Popen(
                     cmd, cwd=str(E2E_DIR), shell=True,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    creationflags=_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    **_proc_group_kwargs(),
                     env=_nocolor_env(),
                 )
                 for raw in iter(self.test_process.stdout.readline, b""):
@@ -1854,7 +1917,7 @@ class TestRunnerApp(ctk.CTk):
                 self._log("   (Click 'Stop Tests' again to force kill)", "warn", "e2e")
                 self._stop_signal_sent = True
                 try:
-                    os.kill(self.test_process.pid, signal.CTRL_BREAK_EVENT)
+                    _interrupt_process_group(self.test_process)
                 except Exception as e:
                     self._log(f"Failed to send stop signal: {e}. Force killing…", "err", "e2e")
                     kill_process_tree(self.test_process.pid)
@@ -1883,7 +1946,7 @@ class TestRunnerApp(ctk.CTk):
                       command=self._refresh_results).pack(side="left", padx=6)
         ctk.CTkButton(bar, text="📂 Open Folder", width=120, fg_color="#475569",
                       hover_color="#64748b",
-                      command=lambda: os.startfile(str(RESULTS_DIR))).pack(side="left", padx=6)
+                      command=lambda: _open_path(str(RESULTS_DIR))).pack(side="left", padx=6)
 
         # Filter dropdown
         ctk.CTkLabel(bar, text="Filter:", font=("Segoe UI", 12),
@@ -2020,7 +2083,7 @@ class TestRunnerApp(ctk.CTk):
                         ctk.CTkButton(
                             urow, text="📊 Report", width=80, height=24,
                             fg_color="#475569", hover_color="#64748b",
-                            command=lambda p=str(report_path): webbrowser.open(p),
+                            command=lambda p=str(report_path): _open_path(p),
                         ).grid(row=0, column=3, padx=3, pady=2)
 
                     log_file = run_dir / "output.log"
@@ -2028,7 +2091,7 @@ class TestRunnerApp(ctk.CTk):
                         ctk.CTkButton(
                             urow, text="📄 Log", width=60, height=24,
                             fg_color="#475569", hover_color="#64748b",
-                            command=lambda p=str(log_file): os.startfile(p),
+                            command=lambda p=str(log_file): _open_path(p),
                         ).grid(row=0, column=4, padx=(0, 6), pady=2)
 
                     role_children.append(urow)
