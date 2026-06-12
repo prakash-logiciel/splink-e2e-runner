@@ -87,6 +87,32 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _IS_WIN = sys.platform == "win32"
 
 
+def _ensure_tool_path() -> None:
+    """Make sure common Node/yarn/git install locations are on PATH.
+
+    When the app is launched from Finder (via the .app/.command, or pythonw on
+    Windows) it inherits a minimal PATH that omits where yarn/node live — so
+    `yarn build` fails with "yarn: command not found" even though it works from
+    a terminal. Prepend the usual locations (idempotent; existing entries win).
+    """
+    if _IS_WIN:
+        return
+    extra = [
+        "/usr/local/bin",          # Intel Homebrew, node.org installer, yarn
+        "/opt/homebrew/bin",       # Apple-silicon Homebrew
+        "/usr/bin",
+        "/bin",
+        os.path.expanduser("~/.yarn/bin"),
+        os.path.expanduser("~/.npm-global/bin"),
+    ]
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    merged = current + [p for p in extra if p and p not in current]
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+
+_ensure_tool_path()
+
+
 def _proc_group_kwargs() -> dict:
     """Popen kwargs that start a child in its own process group, so we can later
     signal the whole tree (Ctrl-Break on Windows, SIGINT to the group on POSIX)."""
@@ -524,6 +550,39 @@ class TestRunnerApp(ctk.CTk):
         self.is_testing = False
         self._stop_tests_flag = False
         self._idle_notified = False
+
+        # ── Playwright run options (session-only; set via ⚙ Options dialog) ──
+        # `_run_last_failed_var` lives here (not in _build_e2e_tab) so the top
+        # "Only Failed" checkbox and the Options dialog's "--last-failed"
+        # checkbox share ONE BooleanVar — `--last-failed` is never duplicated.
+        self._run_last_failed_var = ctk.BooleanVar(value=False)
+        # Resume mode for RESUMABLE_SPECS. Default ON preserves prior behavior
+        # (resume was previously hard-coded ON); toggled via the ⚙ Options dialog.
+        self.pw_resume_var = ctk.BooleanVar(value=True)
+        # Stall watchdog: if a spec prints NO terminal output for this many
+        # minutes, force-kill it and auto-advance to the next spec. Idle-based
+        # (not a total-runtime cap) so an actively-logging spec is never killed.
+        # "0" disables it. Adjustable via the ⚙ Options dialog.
+        self.pw_stall_min = ctk.StringVar(value="10")
+        self.pw_flags = {
+            "headed":      ctk.BooleanVar(value=False),
+            "workers":     ctk.StringVar(value=""),
+            "retries":     ctk.StringVar(value=""),
+            "repeat_each": ctk.StringVar(value=""),
+            "timeout":     ctk.StringVar(value=""),
+            "reporter":    ctk.StringVar(value=""),   # "" | "list" | "html"
+        }
+        # E2E env-var overrides injected into the test subprocess env. Blank =
+        # not injected. dotenv (constant.js/playwright.config.js) does NOT
+        # override already-set process.env, so these win over E2E/.env.
+        # PROGRAM_TIMELINE_TO_TEST is intentionally omitted — it's pinned to
+        # 'Current' in the active playwright.config.js project env.
+        self.pw_env = {k: ctk.StringVar(value="") for k in (
+            "BASE_URL", "MAX_WORKERS", "MAX_RETRIES",
+            "MAX_STORES_TO_TEST", "MAX_STORES_TO_TEST_FOR_MANUFACTURERS",
+            "MFR_BATCH_SIZE", "MFR_TOTAL_ESTIMATE",
+            "EARNINGS_CAP_PERCENTAGE", "LOCAL",
+        )}
         self.idle_start_time = None
         self.last_idle_notify_time = None
         self._monitor_running = True
@@ -806,6 +865,91 @@ class TestRunnerApp(ctk.CTk):
             ).pack(anchor="w", padx=8, pady=2)
 
         # Save & close
+        ctk.CTkButton(dialog, text="✓  Done", width=120,
+                      fg_color=CLR_GREEN, hover_color="#27ae60", text_color="black",
+                      command=dialog.destroy).pack(pady=12)
+
+    # ────────────────────────────────────────────────────────
+    # Playwright Options dialog
+    # ────────────────────────────────────────────────────────
+
+    def _labeled_entry(self, parent, label, var, placeholder=""):
+        """A label + entry row bound to a StringVar (used by the Options dialog)."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(row, text=label, width=240, anchor="w",
+                     font=("Segoe UI", 12)).pack(side="left")
+        ctk.CTkEntry(row, textvariable=var, width=180,
+                     placeholder_text=placeholder).pack(side="left")
+
+    def _open_pw_options_dialog(self):
+        """Session-only Playwright options: CLI flags + E2E env-var overrides.
+
+        Values are bound directly to the BooleanVar/StringVar held on `self`
+        (self.pw_flags / self.pw_env / self._run_last_failed_var), so there is
+        no Save step — "Done" just closes the dialog and the run picks up the
+        current values via _build_pw_command / _collect_env.
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("⚙ Playwright Options")
+        dialog.geometry("520x640")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.configure(fg_color="#0f172a")
+
+        ctk.CTkLabel(dialog, text="Playwright Options",
+                     font=("Segoe UI Semibold", 15)).pack(pady=(16, 2))
+        ctk.CTkLabel(dialog, text="Blank value = flag/var not applied.  (Session only.)",
+                     font=("Segoe UI", 11), text_color="#94a3b8").pack(pady=(0, 8))
+
+        scroll = ctk.CTkScrollableFrame(dialog, fg_color=CLR_CARD, corner_radius=8)
+        scroll.pack(fill="both", expand=True, padx=16, pady=8)
+
+        # ── Resume ──
+        ctk.CTkLabel(scroll, text="Resume",
+                     font=("Segoe UI Semibold", 13)).pack(anchor="w", padx=8, pady=(6, 2))
+        ctk.CTkCheckBox(scroll, text="Resume mode (resume failed runs from last completed item)",
+                        variable=self.pw_resume_var,
+                        font=("Segoe UI", 12), checkbox_width=18, checkbox_height=18
+                        ).pack(anchor="w", padx=12, pady=2)
+
+        # ── Watchdog ──
+        ctk.CTkLabel(scroll, text="Watchdog",
+                     font=("Segoe UI Semibold", 13)).pack(anchor="w", padx=8, pady=(12, 2))
+        ctk.CTkLabel(scroll,
+                     text="Force-skip a spec if it prints no output for this long (0 = off).",
+                     font=("Segoe UI", 11), text_color="#94a3b8").pack(anchor="w", padx=12)
+        self._labeled_entry(scroll, "Stall timeout (min, 0=off)", self.pw_stall_min, "10")
+
+        # ── CLI Flags ──
+        ctk.CTkLabel(scroll, text="CLI Flags",
+                     font=("Segoe UI Semibold", 13)).pack(anchor="w", padx=8, pady=(12, 2))
+        ctk.CTkCheckBox(scroll, text="--headed", variable=self.pw_flags["headed"],
+                        font=("Segoe UI", 12), checkbox_width=18, checkbox_height=18
+                        ).pack(anchor="w", padx=12, pady=2)
+        # Shares the same BooleanVar as the top "Only Failed" checkbox.
+        ctk.CTkCheckBox(scroll, text="--last-failed  (Only Failed)",
+                        variable=self._run_last_failed_var,
+                        font=("Segoe UI", 12), checkbox_width=18, checkbox_height=18
+                        ).pack(anchor="w", padx=12, pady=2)
+        for label, key, ph in [("--workers", "workers", "n"),
+                               ("--retries", "retries", "n"),
+                               ("--repeat-each", "repeat_each", "n"),
+                               ("--timeout", "timeout", "ms")]:
+            self._labeled_entry(scroll, label, self.pw_flags[key], ph)
+        rep_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        rep_row.pack(fill="x", padx=12, pady=2)
+        ctk.CTkLabel(rep_row, text="--reporter", width=240, anchor="w",
+                     font=("Segoe UI", 12)).pack(side="left")
+        ctk.CTkOptionMenu(rep_row, values=["", "list", "html"],
+                          variable=self.pw_flags["reporter"], width=120).pack(side="left")
+
+        # ── Environment Variables ──
+        ctk.CTkLabel(scroll, text="Environment Variables",
+                     font=("Segoe UI Semibold", 13)).pack(anchor="w", padx=8, pady=(12, 2))
+        for key in self.pw_env:   # dict preserves insertion order
+            self._labeled_entry(scroll, key, self.pw_env[key], "")
+
         ctk.CTkButton(dialog, text="✓  Done", width=120,
                       fg_color=CLR_GREEN, hover_color="#27ae60", text_color="black",
                       command=dialog.destroy).pack(pady=12)
@@ -1560,10 +1704,15 @@ class TestRunnerApp(ctk.CTk):
                       fg_color="#2563eb", hover_color="#1d4ed8",
                       command=self._run_all_users).pack(side="left", padx=6, pady=6)
         
-        self._run_last_failed_var = ctk.BooleanVar(value=False)
+        # `_run_last_failed_var` is created in __init__ (shared with the Options
+        # dialog); the checkbox here just binds to it.
         ctk.CTkCheckBox(action_bar, text="Only Failed", variable=self._run_last_failed_var,
                         font=("Segoe UI", 12), checkbox_width=18, checkbox_height=18
                         ).pack(side="left", padx=(10, 6), pady=6)
+
+        ctk.CTkButton(action_bar, text="⚙  Options", width=110,
+                      fg_color="#475569", hover_color="#64748b",
+                      command=self._open_pw_options_dialog).pack(side="left", padx=6, pady=6)
 
         ctk.CTkButton(action_bar, text="⏭  Skip Current", width=120,
                       fg_color="#ea580c", hover_color="#c2410c", text_color="white",
@@ -1786,128 +1935,234 @@ class TestRunnerApp(ctk.CTk):
         self._stop_tests_flag = False
         threading.Thread(target=self._execute_tests, args=(queue,), daemon=True).start()
 
+    def _build_pw_command(self, name: str, spec: str) -> str:
+        """Build `npx playwright test` for ONE spec, applying the session-only
+        flags from the ⚙ Options dialog. `--last-failed` is sourced from the
+        single shared `_run_last_failed_var` so it's never duplicated."""
+        cmd = f'npx playwright test -g "{name}" {spec}'
+        f = self.pw_flags
+        if f["headed"].get():
+            cmd += " --headed"
+        if self._run_last_failed_var.get():
+            cmd += " --last-failed"
+        for flag, key in [("--workers", "workers"), ("--retries", "retries"),
+                          ("--repeat-each", "repeat_each"), ("--timeout", "timeout"),
+                          ("--reporter", "reporter")]:
+            val = f[key].get().strip()
+            if val:
+                cmd += f" {flag} {val}"
+        return cmd
+
+    def _collect_env(self) -> dict:
+        """Subprocess env = no-color base + non-empty pw_env overrides.
+
+        dotenv (constant.js / playwright.config.js) does NOT override keys that
+        are already set in process.env, so these injected values win over
+        whatever is in E2E/.env."""
+        env = _nocolor_env()
+        env.update({k: v.get().strip()
+                    for k, v in self.pw_env.items() if v.get().strip()})
+        return env
+
     def _execute_tests(self, queue: list):
-        """Run playwright tests for each user in queue, sequentially."""
+        """Run playwright tests ONE SUBPROCESS PER SPEC, sequentially.
+
+        Outer loop = users (queue entries); inner loop = each spec for that
+        user. Because each spec is its own process, "Skip Current" interrupts
+        only the current spec and the inner loop advances to the next spec;
+        "Stop Tests" sets `_stop_tests_flag`, which both loops check."""
         self.is_testing = True
         self._idle_notified = False
-        total = len(queue)
+        total_users = len(queue)
+        total_specs = sum(len(tf) for (_, _, _, tf) in queue)
         self.after(0, lambda: self._test_status_label.configure(
-            text=f"Running: 0/{total}", text_color=CLR_ORANGE))
+            text=f"Running: 0/{total_users}", text_color=CLR_ORANGE))
 
-        for idx, (map_name, user_key, user_data, test_files) in enumerate(queue):
+        # Snapshot the env overrides once at run start.
+        env = self._collect_env()
+
+        for uidx, (map_name, user_key, user_data, test_files) in enumerate(queue):
             if self._stop_tests_flag:
                 self._log("⬛ Tests stopped by user.", target="e2e")
                 break
+            if not test_files:
+                continue
 
             name = user_data.get("name", user_key)
-            self.after(0, lambda n=name, i=idx: self._test_status_label.configure(
-                text=f"Running: {i + 1}/{total}  —  {n}",
-                text_color=CLR_ORANGE))
+            uid = f"{map_name}::{user_key}"
+            n_specs = len(test_files)
+            user_failed = False
 
             self._log(f"\n{'═' * 60}", target="e2e")
-            self._log(f"▶ Running tests for: {name}  ({map_name})", target="e2e")
-            self._log(f"  Test files: {len(test_files)}", target="e2e")
-
-            # Check if any selected tests are resumable
-            has_resumable = any(t in RESUMABLE_SPECS for t in test_files)
-            if has_resumable:
-                uid = f"{map_name}::{user_key}"
-                resume_enabled = True  # Always enable resume mode
-                self._save_test_config(name, resume_mode=resume_enabled)
-                self._log(f"  Resume mode: {'ON' if resume_enabled else 'OFF'}", "info", "e2e")
-                # Log manufacturer selections if any
-                if uid in self.manufacturer_selections:
-                    selected = [m for m, v in self.manufacturer_selections[uid].items() if v.get()]
-                    if selected:
-                        self._log(f"  Selected manufacturers: {', '.join(selected)}", "info", "e2e")
-
+            self._log(f"▶ Running tests for: {name}  ({map_name})  — {n_specs} spec(s)", target="e2e")
             self._log(f"{'═' * 60}", target="e2e")
 
-            # Build command
-            files_str = " ".join(test_files)
-            cmd = f'npx playwright test -g "{name}" {files_str}'
-            if getattr(self, "_run_last_failed_var", None) and self._run_last_failed_var.get():
-                cmd += " --last-failed"
-            self._log(f"$ {cmd}", target="e2e")
+            for sidx, spec in enumerate(test_files):
+                if self._stop_tests_flag:
+                    self._log("⬛ Tests stopped by user.", target="e2e")
+                    break
 
-            # Prepare results dir
-            now = datetime.now()
-            day_dir = RESULTS_DIR / now.strftime("%Y-%m-%d")
-            run_dir = day_dir / f"{now.strftime('%H-%M-%S')}_{name.replace(' ', '_')}"
-            run_dir.mkdir(parents=True, exist_ok=True)
+                spec_base = Path(spec).stem
+                self.after(0, lambda u=uidx, n=name, s=sidx, sb=spec_base, ns=n_specs:
+                           self._test_status_label.configure(
+                               text=f"Running {u + 1}/{total_users} — {n} · spec {s + 1}/{ns}: {sb}",
+                               text_color=CLR_ORANGE))
 
-            # Clear old playwright-report and test-results to prevent stale artifacts
-            pw_report_dir = E2E_DIR / "playwright-report"
-            if pw_report_dir.exists():
+                # Resume mode for resumable specs (toggled via ⚙ Options; write
+                # test_config.json per spec so the test reads the current value).
+                if spec in RESUMABLE_SPECS:
+                    resume_enabled = self.pw_resume_var.get()
+                    self._save_test_config(name, resume_mode=resume_enabled)
+                    self._log(f"  Resume mode {'ON' if resume_enabled else 'OFF'} for {spec_base}", "info", "e2e")
+                    if uid in self.manufacturer_selections:
+                        selected = [m for m, v in self.manufacturer_selections[uid].items() if v.get()]
+                        if selected:
+                            self._log(f"  Selected manufacturers: {', '.join(selected)}", "info", "e2e")
+
+                cmd = self._build_pw_command(name, spec)
+                self._log(f"$ {cmd}", target="e2e")
+
+                # Prepare per-spec results dir. Keep HH-MM-SS as the first 8
+                # chars — _refresh_results slices run_dir.name[:8] for the time.
+                now = datetime.now()
+                day_dir = RESULTS_DIR / now.strftime("%Y-%m-%d")
+                run_dir = day_dir / f"{now.strftime('%H-%M-%S')}_{name.replace(' ', '_')}_{spec_base}"
+                run_dir.mkdir(parents=True, exist_ok=True)
+
+                # Clear old playwright-report and test-results BEFORE each spec
+                # (per-spec zero contamination).
+                pw_report_dir = E2E_DIR / "playwright-report"
+                if pw_report_dir.exists():
+                    try:
+                        shutil.rmtree(pw_report_dir)
+                    except Exception as e:
+                        self._log(f"Warning: Could not clear {pw_report_dir}: {e}", "warn", "e2e")
+
+                pw_results_dir = E2E_DIR / "test-results"
+                if pw_results_dir.exists():
+                    try:
+                        shutil.rmtree(pw_results_dir)
+                    except Exception:
+                        pass
+
+                log_lines = []
+                self._stop_signal_sent = False   # reset per spec for two-stage Stop
+
+                # ── Stall watchdog ──
+                # If the spec prints NO output for `stall_min` minutes, force-kill
+                # it and advance to the next spec. Idle-based (resets on every line
+                # of output), so an actively-logging spec is never killed — this
+                # does NOT cap total runtime. "0" disables it. Re-read per spec so
+                # the ⚙ Options value can be changed mid-run.
                 try:
-                    shutil.rmtree(pw_report_dir)
-                except Exception as e:
-                    self._log(f"Warning: Could not clear {pw_report_dir}: {e}", "warn", "e2e")
+                    stall_min = float(self.pw_stall_min.get().strip() or "0")
+                except (ValueError, AttributeError):
+                    stall_min = 0
+                stall_seconds = stall_min * 60 if stall_min > 0 else 0
+                last_output = [time.time()]
+                watchdog_stop = threading.Event()
+                stalled = [False]
 
-            pw_results_dir = E2E_DIR / "test-results"
-            if pw_results_dir.exists():
+                rc = None
                 try:
-                    shutil.rmtree(pw_results_dir)
-                except Exception:
-                    pass
+                    proc = subprocess.Popen(
+                        cmd, cwd=str(E2E_DIR), shell=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        **_proc_group_kwargs(),
+                        env=env,
+                    )
+                    self.test_process = proc
+                    last_output[0] = time.time()
 
-            log_lines = []
-            self._stop_signal_sent = False
-            try:
-                self.test_process = subprocess.Popen(
-                    cmd, cwd=str(E2E_DIR), shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    **_proc_group_kwargs(),
-                    env=_nocolor_env(),
-                )
-                for raw in iter(self.test_process.stdout.readline, b""):
-                    if not raw:
-                        break
-                    line = strip_ansi(raw.decode("utf-8", errors="replace")).rstrip()
-                    if not line:
-                        continue  # skip empty lines (progress-indicator junk)
-                    log_lines.append(line)
-                    self.after(0, self._log, line, "", "e2e")
-                self.test_process.wait(timeout=7200)
-                rc = self.test_process.returncode
-            except Exception as exc:
-                rc = -1
-                self._log(f"Error: {exc}", "err", "e2e")
-                log_lines.append(f"Error: {exc}")
+                    def _stall_watchdog(p=proc, smin=stall_min, ssec=stall_seconds,
+                                        sb=spec_base):
+                        if ssec <= 0:
+                            return  # watchdog disabled
+                        # Wake periodically; exit promptly when the spec ends.
+                        while not watchdog_stop.wait(5):
+                            if p.poll() is not None:
+                                return  # process already exited
+                            if time.time() - last_output[0] > ssec:
+                                stalled[0] = True
+                                self.after(
+                                    0, self._log,
+                                    f"⏱ No terminal output for {smin:g} min — "
+                                    f"force-skipping stalled spec '{sb}' and continuing…",
+                                    "warn", "e2e",
+                                )
+                                try:
+                                    kill_process_tree(p.pid)
+                                except Exception:
+                                    pass
+                                return
 
-            # Save results — clean UTF-8 text
-            (run_dir / "output.log").write_text("\n".join(log_lines), encoding="utf-8")
-            (run_dir / "meta.json").write_text(json.dumps({
-                "user": name, "email": user_data.get("email", ""),
-                "role": map_name, "tests": test_files,
-                "exit_code": rc, "timestamp": now.isoformat(),
-            }, indent=2), encoding="utf-8")
+                    wd = threading.Thread(target=_stall_watchdog, daemon=True)
+                    wd.start()
 
-            # Copy playwright report
-            pw_report = E2E_DIR / "playwright-report"
-            dest_report = run_dir / "playwright-report"
-            if pw_report.exists():
-                try:
-                    if dest_report.exists():
-                        shutil.rmtree(dest_report)
-                    shutil.copytree(str(pw_report), str(dest_report))
-                except Exception:
-                    pass
+                    for raw in iter(proc.stdout.readline, b""):
+                        last_output[0] = time.time()  # any output counts as movement
+                        if not raw:
+                            break
+                        line = strip_ansi(raw.decode("utf-8", errors="replace")).rstrip()
+                        if not line:
+                            continue  # skip empty lines (progress-indicator junk)
+                        log_lines.append(line)
+                        self.after(0, self._log, line, "", "e2e")
+                    proc.wait(timeout=7200)
+                    rc = proc.returncode
+                except Exception as exc:
+                    rc = -1
+                    self._log(f"Error: {exc}", "err", "e2e")
+                    log_lines.append(f"Error: {exc}")
+                finally:
+                    watchdog_stop.set()  # stop this spec's watchdog thread
 
-            status = "PASSED" if rc == 0 else "FAILED"
-            self._log(f"Result: {status}  (exit code {rc})", target="e2e")
-            self._log(f"Saved to: {run_dir}", target="e2e")
-            notify(f"Test {status}: {name}", f"E2E tests for {name} {status.lower()}")
+                # Save results — clean UTF-8 text
+                (run_dir / "output.log").write_text("\n".join(log_lines), encoding="utf-8")
+                (run_dir / "meta.json").write_text(json.dumps({
+                    "user": name, "email": user_data.get("email", ""),
+                    "role": map_name, "tests": [spec], "spec": spec,
+                    "exit_code": rc, "stalled": stalled[0], "timestamp": now.isoformat(),
+                }, indent=2), encoding="utf-8")
 
-            # Refresh results and resume indicators immediately after each user completes
-            self.after(0, self._refresh_results)
-            self.after(500, self._refresh_resume_indicators)
+                # Copy playwright report
+                pw_report = E2E_DIR / "playwright-report"
+                dest_report = run_dir / "playwright-report"
+                if pw_report.exists():
+                    try:
+                        if dest_report.exists():
+                            shutil.rmtree(dest_report)
+                        shutil.copytree(str(pw_report), str(dest_report))
+                    except Exception:
+                        pass
+
+                if stalled[0]:
+                    user_failed = True
+                    self._log(
+                        f"Result [{spec_base}]: STALLED — no output for {stall_min:g} min, "
+                        f"skipped to next spec", "warn", "e2e",
+                    )
+                else:
+                    status = "PASSED" if rc == 0 else "FAILED"
+                    if rc != 0:
+                        user_failed = True
+                    self._log(f"Result [{spec_base}]: {status}  (exit code {rc})", target="e2e")
+                self._log(f"Saved to: {run_dir}", target="e2e")
+
+                # Refresh results and resume indicators immediately after each spec
+                self.after(0, self._refresh_results)
+                self.after(500, self._refresh_resume_indicators)
+
+            # One OS notification per user (after the inner loop), unless stopped.
+            if not self._stop_tests_flag:
+                us = "FAILED" if user_failed else "PASSED"
+                notify(f"User {us}: {name}", f"E2E specs for {name} {us.lower()}")
 
         self.is_testing = False
         self.test_process = None
         self.after(0, lambda: self._test_status_label.configure(
             text="Status: Idle", text_color="#94a3b8"))
-        notify("All Tests Complete", f"Finished {total} user(s)")
+        notify("All Tests Complete", f"Finished {total_users} user(s) / {total_specs} spec(s)")
 
     def _stop_tests(self):
         self._stop_tests_flag = True
@@ -1927,8 +2182,25 @@ class TestRunnerApp(ctk.CTk):
 
     def _skip_current_test(self):
         if self.test_process and self.test_process.poll() is None:
-            self._log("⏭ Skipping current test process…", "warn", "e2e")
-            kill_process_tree(self.test_process.pid)
+            # Gracefully interrupt (SIGINT / Ctrl-Break) instead of force-killing,
+            # so Playwright finishes writing its HTML report for the tests that
+            # ran before we copy it into the results history. A hard kill
+            # (SIGKILL) would terminate Playwright before the report is written,
+            # leaving the run's Report tab empty. We do NOT set
+            # `_stop_tests_flag`, so the per-spec inner loop advances to the next
+            # spec after the current process exits and its report is copied.
+            self._log(
+                "⏭ Skipping current test — interrupting so Playwright can write its report…",
+                "warn",
+                "e2e",
+            )
+            try:
+                _interrupt_process_group(self.test_process)
+            except Exception as e:
+                self._log(
+                    f"Graceful interrupt failed: {e}. Force killing…", "err", "e2e"
+                )
+                kill_process_tree(self.test_process.pid)
         else:
             self._log("No test process is currently running to skip.", "warn", "e2e")
 
