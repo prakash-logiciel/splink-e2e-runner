@@ -1,4 +1,5 @@
 test_results_history/
+.playwright-mcp
 
 # Python bytecode
 __pycache__/
