@@ -1,3 +1,4 @@
 customtkinter
 psutil
 plyer
+pyobjus; sys_platform == "darwin"  # macOS native notifications backend for plyer

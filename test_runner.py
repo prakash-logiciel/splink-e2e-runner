@@ -87,6 +87,57 @@ _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 _IS_WIN = sys.platform == "win32"
 
 
+def _node_manager_bins() -> List[str]:
+    """Node bin dirs owned by common version managers (nvm, fnm, volta).
+
+    These live under the user's home and are put on PATH by shell rc files
+    (~/.zshrc etc.) which Finder-launched apps never source — so yarn/node
+    installed via nvm are invisible to `yarn build` even though they work in a
+    terminal. Return newest-version-first so the right node wins.
+    """
+    import glob
+
+    def _ver_key(p: str):
+        # p like .../versions/node/v24.18.0/bin -> (24, 18, 0)
+        name = os.path.basename(os.path.dirname(p))
+        nums = [int(n) for n in re.findall(r"\d+", name)[:3]]
+        return tuple(nums) or (0,)
+
+    bins: List[str] = []
+    # If the parent shell happened to export NVM_BIN, trust it first.
+    if os.environ.get("NVM_BIN"):
+        bins.append(os.environ["NVM_BIN"])
+
+    # nvm — resolve the `default` alias if it points at an installed version,
+    # otherwise fall back to the highest installed version.
+    nvm_dir = os.environ.get("NVM_DIR", os.path.expanduser("~/.nvm"))
+    node_dirs = sorted(
+        glob.glob(os.path.join(nvm_dir, "versions", "node", "*", "bin")),
+        key=_ver_key, reverse=True,
+    )
+    default_alias = os.path.join(nvm_dir, "alias", "default")
+    if os.path.isfile(default_alias):
+        try:
+            with open(default_alias) as fh:
+                pinned = fh.read().strip()
+            pinned_bin = os.path.join(nvm_dir, "versions", "node", pinned, "bin")
+            if pinned_bin in node_dirs:
+                node_dirs.remove(pinned_bin)
+                node_dirs.insert(0, pinned_bin)
+        except OSError:
+            pass
+    bins.extend(node_dirs)
+
+    # volta and fnm, for good measure.
+    bins.append(os.path.expanduser("~/.volta/bin"))
+    fnm_dir = os.environ.get("FNM_DIR", os.path.expanduser("~/.fnm"))
+    bins.extend(sorted(
+        glob.glob(os.path.join(fnm_dir, "node-versions", "*", "installation", "bin")),
+        reverse=True,
+    ))
+    return bins
+
+
 def _ensure_tool_path() -> None:
     """Make sure common Node/yarn/git install locations are on PATH.
 
@@ -97,7 +148,7 @@ def _ensure_tool_path() -> None:
     """
     if _IS_WIN:
         return
-    extra = [
+    extra = _node_manager_bins() + [
         "/usr/local/bin",          # Intel Homebrew, node.org installer, yarn
         "/opt/homebrew/bin",       # Apple-silicon Homebrew
         "/usr/bin",

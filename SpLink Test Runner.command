@@ -7,9 +7,11 @@
 # Resolve this script's own directory (works regardless of where it's run from)
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Use the framework Python that has the GUI deps (customtkinter, etc.).
-# The default `python3` (pyenv) does NOT have them.
-PYTHON="/usr/local/bin/python3"
+# Use the project virtualenv's Python, which has the GUI deps
+# (customtkinter, psutil, plyer) plus Tk via the python-tk@3.14 brew formula.
+# Fall back to the framework Python only if the venv is missing.
+PYTHON="$DIR/.venv/bin/python3"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 
 # Launch detached: nohup + background + disown so it survives the terminal closing.
 nohup "$PYTHON" "$DIR/test_runner.py" >/dev/null 2>&1 &
